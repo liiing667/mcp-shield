@@ -39,11 +39,14 @@ async function scanWithTreeDisplay(
   configPath: string,
   claudeApiKey?: string,
   identifyAs?: string,
-  safeList?: string[]
+  safeList?: string[],
+  jsonOutput = false
 ) {
-  console.log(chalk.bold(`Scanning "${configPath}"`))
+  if (!jsonOutput) {
+    console.log(chalk.bold(`Scanning "${configPath}"`))
+  }
 
-  const tree = new Tree()
+  const tree: Tree | null = jsonOutput ? null : new Tree()
 
   try {
     const configData = JSON.parse(fs.readFileSync(configPath, 'utf8'))
@@ -58,30 +61,39 @@ async function scanWithTreeDisplay(
     }
 
     if (!mcpServers) {
-      console.log(
-        chalk.yellow(`No MCP servers found in ${configPath}`)
-      )
+      if (!jsonOutput) {
+        console.log(
+          chalk.yellow(`No MCP servers found in ${configPath}`)
+        )
+      }
       return
     }
 
-    const outputNode = tree.addRoot(
-      `Found ${Object.keys(mcpServers).length} servers:`
-    )
+    const outputNode = tree
+      ? tree.addRoot(
+          `Found ${Object.keys(mcpServers).length} servers:`
+        )
+      : null
 
     // Setup initial server nodes in the tree (all pending)
     const serverNodes = new Map()
     const toolNodes = new Map()
 
-    for (const serverName of Object.keys(mcpServers)) {
-      const serverNode = tree.addChild(
-        outputNode,
-        `○ ${chalk.bold(serverName)} connecting...`
-      )
-      serverNodes.set(serverName, serverNode)
+    if (tree && outputNode) {
+      for (const serverName of Object.keys(mcpServers)) {
+        const serverNode = tree.addChild(
+          outputNode,
+          `○ ${chalk.bold(serverName)} connecting...`
+        )
+        serverNodes.set(serverName, serverNode)
+      }
     }
 
     // Define progress callback for scanner
     const progressCallback: ScanProgressCallback = (event) => {
+      if (!tree) {
+        return
+      }
       let needsRender = true
 
       if (event.type === 'server-connected') {
@@ -172,16 +184,19 @@ async function scanWithTreeDisplay(
     )
 
     // Final tree render and persist output
-    tree.render()
-    tree.done()
+    if (tree) {
+      tree.render()
+      tree.done()
+    }
 
     return results
   } catch (error: any) {
-    console.log(
-      chalk.red(`Error scanning ${configPath}: ${error.message}`)
-    )
-
-    tree.done()
+    if (tree) {
+      console.log(
+        chalk.red(`Error scanning ${configPath}: ${error.message}`)
+      )
+      tree.done()
+    }
     throw error
   }
 }
@@ -217,12 +232,15 @@ function displayVulnerabilities(
       )
       console.log('   Details:')
       vuln.crossRefMatches.forEach((match) => {
+        const target = match.referencedTool
+          ? `${chalk.bold(match.referencedName)} / ${chalk.bold(
+              match.referencedTool
+            )}`
+          : chalk.bold(match.referencedName)
         console.log(
-          `     – Server ${chalk.bold(
-            match.server
-          )}, Tool ${chalk.bold(match.tool)} references "${chalk.bold(
-            match.referencedName
-          )}": ${chalk.gray(match.context)}`
+          `     – ${chalk.bold(match.server)} / ${chalk.bold(
+            match.tool
+          )} → ${target}: ${chalk.gray(match.context)}`
         )
       })
     } else {
@@ -327,42 +345,49 @@ program
     '--safe-list <servers>',
     'Comma-separated list of server names to exclude from scanning'
   )
+  .option(
+    '--json',
+    'Emit machine-readable JSON instead of the interactive tree'
+  )
   .action(
     async (options: {
       path: string
       claudeApiKey?: string
       identifyAs?: string
       safeList?: string
+      json?: boolean
     }) => {
       try {
-        // Banner
-
-        // Show banner in a boxed format
-        const banner = boxen(
-          chalk.bold.blue(`MCP-Shield v${packageJson.version}`) +
-            '\n' +
-            chalk.blue(
-              'Security Scanner for Model Context Protocol Servers'
-            ),
-          {
-            padding: 1,
-            margin: 1,
-            borderStyle: 'round',
-            borderColor: 'blue',
-          }
-        )
-        console.log(banner)
+        if (!options.json) {
+          // Show banner in a boxed format
+          const banner = boxen(
+            chalk.bold.blue(`MCP-Shield v${packageJson.version}`) +
+              '\n' +
+              chalk.blue(
+                'Security Scanner for Model Context Protocol Servers'
+              ),
+            {
+              padding: 1,
+              margin: 1,
+              borderStyle: 'round',
+              borderColor: 'blue',
+            }
+          )
+          console.log(banner)
+        }
 
         const paths = options.path
           ? [options.path]
           : await findMcpConfigs()
 
         if (paths.length === 0) {
-          console.log(
-            chalk.yellow(
-              `${logSymbols.warning} No MCP server configurations found.`
+          if (!options.json) {
+            console.log(
+              chalk.yellow(
+                `${logSymbols.warning} No MCP server configurations found.`
+              )
             )
-          )
+          }
           return
         }
 
@@ -380,7 +405,8 @@ program
               options.identifyAs,
               options.safeList
                 ? options.safeList.split(',').map((s) => s.trim())
-                : undefined
+                : undefined,
+              options.json
             )
 
             if (!results) {
@@ -390,21 +416,77 @@ program
             totalVulnerabilities += results.vulnerabilities.length
             resultsArr.push({configPath, results})
           } catch (error: any) {
-            console.error(
-              chalk.red(
-                `${logSymbols.error} Error scanning ${configPath}: ${error.message}`
+            if (!options.json) {
+              console.error(
+                chalk.red(
+                  `${logSymbols.error} Error scanning ${configPath}: ${error.message}`
+                )
               )
-            )
+            } else {
+              console.error(
+                JSON.stringify({
+                  configPath,
+                  error: error.message,
+                })
+              )
+            }
           }
+        }
+
+        if (options.json) {
+          const payload = resultsArr.map(({configPath, results}) => {
+            const crossRefVulnerability =
+              results.vulnerabilities.find(
+                (vulnerability) => vulnerability.crossRefMatches
+              )
+            const graph = (
+              crossRefVulnerability?.crossRefMatches || []
+            ).map((match) => ({
+              source: {
+                server: match.server,
+                tool: match.tool,
+              },
+              target: {
+                server: match.referencedName,
+                tool: match.referencedTool || null,
+              },
+              severity:
+                crossRefVulnerability?.severity || 'MEDIUM',
+            }))
+
+            return {
+              configPath,
+              crossOriginViolation:
+                results.crossOriginViolation,
+              graph,
+              vulnerabilities: results.vulnerabilities
+                .filter(
+                  (vulnerability) =>
+                    !vulnerability.crossRefMatches
+                )
+                .map((vulnerability) => ({
+                  severity: vulnerability.severity,
+                  server: vulnerability.server,
+                  tool: vulnerability.tool || null,
+                })),
+            }
+          })
+
+          console.log(JSON.stringify(payload, null, 2))
+          return
         }
 
         for (const {configPath, results} of resultsArr) {
           displayVulnerabilities(results, configPath)
         }
       } catch (error: any) {
-        console.error(
-          chalk.red(`\n${logSymbols.error} Error: ${error.message}`)
-        )
+        if (!options.json) {
+          console.error(
+            chalk.red(
+              `\n${logSymbols.error} Error: ${error.message}`
+            )
+          )
+        }
         process.exit(1)
       }
     }

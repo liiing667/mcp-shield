@@ -142,6 +142,19 @@ export interface CrossRefMatch {
   server: string
   tool: string
   referencedName: string
+  referencedTool?: string
+  context: string
+}
+
+/**
+ * A single directed cross-origin relationship between two tools.
+ * Each source/tool -> target/tool pair is reported at most once.
+ */
+export interface CrossOriginEdge {
+  sourceServer: string
+  sourceTool: string
+  targetServer: string
+  targetTool?: string
   context: string
 }
 

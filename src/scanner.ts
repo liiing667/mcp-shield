@@ -14,8 +14,13 @@ import {
   ScanResult,
   Vulnerability,
   CrossRefMatch,
+  CrossOriginEdge,
   ClaudeAnalysis,
 } from './types.js'
+import {
+  canonicalizeName,
+  CrossOriginServerInfo,
+} from './analyzers/tool-analyzer.js'
 
 export async function scanMcpServer(
   configPath: string,
@@ -203,46 +208,105 @@ export async function scanMcpServer(
       type: 'cross-origin-check',
     })
 
-    const crossRefSources = new Set()
-    const crossRefMatches: CrossRefMatch[] = []
+    // One edge per distinct source/tool -> target/tool relationship.
+    // Keyed canonically so aliases (underscores/hyphens) and casing
+    // variants of the same pair collapse into a single report.
+    const edgesByKey = new Map<string, CrossOriginEdge>()
+    const safeSet = new Set(
+      (safeList || []).map((name) => canonicalizeName(name))
+    )
 
     for (const [serverName, tools] of Object.entries(
       serversWithTools
     )) {
-      const otherServerNames = Object.keys(serversWithTools).filter(
-        (name) => name !== serverName
+      // Safe list applies to the target end as well: safe-listed servers
+      // are never exposed as cross-origin targets.
+      const otherServers: CrossOriginServerInfo[] = Object.entries(
+        serversWithTools
       )
+        .filter(
+          ([name]) =>
+            name !== serverName &&
+            !safeSet.has(canonicalizeName(name))
+        )
+        .map(([name, otherTools]) => ({
+          name,
+          tools: otherTools.map((tool) => ({name: tool.name})),
+        }))
 
       for (const tool of tools) {
         if (!tool.description) continue
 
         const crossOriginResult = detectCrossOriginViolations(
           tool.description,
-          otherServerNames,
+          otherServers,
           serverName,
           safeList
         )
 
         if (crossOriginResult.detected) {
           result.crossOriginViolation = true
-          crossOriginResult.matches.forEach((match) => {
-            crossRefSources.add(match.referencedServer)
-            crossRefMatches.push({
-              server: serverName,
-              tool: tool.name,
-              referencedName: match.referencedServer!,
-              context: match.context,
-            })
+          crossOriginResult.edges.forEach((edge) => {
+            edge.sourceTool = tool.name
+            const edgeKey = [
+              canonicalizeName(edge.sourceServer),
+              canonicalizeName(edge.sourceTool),
+              canonicalizeName(edge.targetServer),
+              edge.targetTool
+                ? canonicalizeName(edge.targetTool)
+                : '',
+            ].join('->')
+
+            if (!edgesByKey.has(edgeKey)) {
+              edgesByKey.set(edgeKey, edge)
+            }
           })
         }
       }
     }
 
-    if (crossRefMatches.length > 0) {
+    if (edgesByKey.size > 0) {
+      const crossRefEdges = Array.from(edgesByKey.values()).sort(
+        (left, right) => {
+          const leftKey = [
+            left.sourceServer,
+            left.sourceTool,
+            left.targetServer,
+            left.targetTool || '',
+          ]
+            .map(canonicalizeName)
+            .join('->')
+          const rightKey = [
+            right.sourceServer,
+            right.sourceTool,
+            right.targetServer,
+            right.targetTool || '',
+          ]
+            .map(canonicalizeName)
+            .join('->')
+          return leftKey.localeCompare(rightKey)
+        }
+      )
+
+      const crossRefMatches: CrossRefMatch[] = crossRefEdges.map(
+        (edge) => ({
+          server: edge.sourceServer,
+          tool: edge.sourceTool,
+          referencedName: edge.targetServer,
+          referencedTool: edge.targetTool,
+          context: edge.context,
+        })
+      )
+
+      const crossRefSources = Array.from(
+        new Set(crossRefEdges.map((edge) => edge.targetServer))
+      ).sort((left, right) =>
+        canonicalizeName(left).localeCompare(canonicalizeName(right))
+      )
+
       const vulnerability: Vulnerability = {
         severity: 'MEDIUM',
-        server: Array.from(crossRefSources).join(', '),
-
+        server: crossRefSources.join(', '),
         crossRefMatches,
       }
       result.vulnerabilities.push(vulnerability)

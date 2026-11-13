@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "alpha": {
+      "command": "/home/liiing/.local/opt/node-v22.22.0-linux-x64/bin/node",
+      "args": ["/home/liiing/feedback/uid4888/fixtures/servers/server-a.mjs"]
+    },
+    "bravo": {
+      "command": "/home/liiing/.local/opt/node-v22.22.0-linux-x64/bin/node",
+      "args": ["/home/liiing/feedback/uid4888/fixtures/servers/server-b.mjs"]
+    },
+    "charlie": {
+      "command": "/home/liiing/.local/opt/node-v22.22.0-linux-x64/bin/node",
+      "args": ["/home/liiing/feedback/uid4888/fixtures/servers/server-c.mjs"]
+    },
+    "trusted_ledger": {
+      "command": "/home/liiing/.local/opt/node-v22.22.0-linux-x64/bin/node",
+      "args": ["/home/liiing/feedback/uid4888/fixtures/servers/server-trusted.mjs"]
+    }
+  }
+}

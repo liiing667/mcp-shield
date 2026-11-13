@@ -1,4 +1,4 @@
-import {DetectionMatch} from '../types.js'
+import {CrossOriginEdge, DetectionMatch} from '../types.js'
 
 interface Pattern {
   pattern: RegExp
@@ -223,76 +223,248 @@ export function detectSensitiveFileAccess(toolDescription?: string) {
   return detectPatterns(toolDescription, patterns)
 }
 
+/**
+ * Canonicalize a name so that underscore/hyphen aliases and casing
+ * differences all resolve to the same key:
+ * "MCP_WhatsApp", "mcp-whatsapp" and "mcp_whatsapp" -> "mcp-whatsapp"
+ */
+export function canonicalizeName(name: string): string {
+  return name
+    .toLowerCase()
+    .trim()
+    .replace(/[_]+/g, '-')
+    .replace(/-+/g, '-')
+}
+
+export interface CrossOriginServerInfo {
+  name: string
+  tools: Array<{name: string}>
+}
+
+/**
+ * Detect cross-origin tool references inside a tool description.
+ *
+ * The description is scanned token by token. A token can reference either
+ * another server (e.g. "(mcp_whatsapp)") or one of its tools (e.g.
+ * "send_message"). Underscore/hyphen aliases and casing differences are
+ * canonicalized before matching, so "MCP_WhatsApp", "mcp-whatsapp" and
+ * "mcp_whatsapp" resolve to the same server.
+ *
+ * Each distinct source/tool -> target/tool relationship is emitted exactly
+ * once, no matter how many times (or under which alias) it is mentioned.
+ */
 export function detectCrossOriginViolations(
   toolDescription: string | undefined,
-  otherServerNames: string[] | undefined,
+  otherServers: CrossOriginServerInfo[] | undefined,
   currentServerName: string,
   safeList?: string[]
-) {
+): {detected: boolean; edges: CrossOriginEdge[]} {
   if (!toolDescription) {
-    return {detected: false, matches: []}
+    return {detected: false, edges: []}
   }
 
-  const relevantPopularServers = POPULAR_MCP_SERVERS.filter(
-    (popularName) => popularName !== currentServerName
+  const safeSet = new Set(
+    (safeList || []).map((name) => canonicalizeName(name))
   )
 
-  const combinedServerNames = [
-    ...(otherServerNames || []).filter(
-      (name) => !safeList || !safeList.includes(name)
-    ),
-    ...relevantPopularServers,
-  ]
+  // Popular servers are implicit cross-origin targets. The safe list applies
+  // to both ends of a relationship, including these implicit targets.
+  const configuredNames = new Set(
+    (otherServers || []).map((server) =>
+      canonicalizeName(server.name)
+    )
+  )
+  const implicitPopularServers: CrossOriginServerInfo[] =
+    POPULAR_MCP_SERVERS.filter(
+      (popularName) =>
+        canonicalizeName(popularName) !==
+          canonicalizeName(currentServerName) &&
+        !safeSet.has(canonicalizeName(popularName)) &&
+        !configuredNames.has(canonicalizeName(popularName))
+    ).map((name) => ({name, tools: []}))
 
-  if (!combinedServerNames.length) {
-    return {detected: false, matches: []}
+  const candidateServers = [
+    ...(otherServers || []),
+    ...implicitPopularServers,
+  ].filter(
+    (server) => !safeSet.has(canonicalizeName(server.name))
+  )
+
+  if (candidateServers.length === 0) {
+    return {detected: false, edges: []}
   }
 
-  const matches = []
-  const tokens = toolDescription.toLowerCase().split(/\s+/)
-  const flaggedNames = combinedServerNames.map((name) =>
-    name.toLowerCase()
-  )
+  const serverByKey = new Map<
+    string,
+    {name: string; toolByKey: Map<string, string>}
+  >()
+  const toolOwners = new Map<
+    string,
+    Array<{serverName: string; toolName: string}>
+  >()
 
-  for (const token of tokens) {
-    // Clean token: remove surrounding parentheses
-    let cleanedToken = token.replace(/^\((.*)\)$/, '$1')
-    // Normalize token: replace underscores with hyphens
-    cleanedToken = cleanedToken.replace(/_/g, '-')
+  for (const server of candidateServers) {
+    const toolByKey = new Map<string, string>()
+    for (const tool of server.tools || []) {
+      toolByKey.set(canonicalizeName(tool.name), tool.name)
+      const owners =
+        toolOwners.get(canonicalizeName(tool.name)) || []
+      owners.push({serverName: server.name, toolName: tool.name})
+      toolOwners.set(canonicalizeName(tool.name), owners)
+    }
+    serverByKey.set(canonicalizeName(server.name), {
+      name: server.name,
+      toolByKey,
+    })
+  }
 
-    if (flaggedNames.includes(cleanedToken)) {
-      // Find where the original token occurs in the description for context
-      const regex = new RegExp(`\\b${token}\\b`, 'i') // Use original token for regex
-      const match = toolDescription.match(regex)
-      if (match) {
-        // Extract context around the match
-        const startIndex = Math.max(0, match.index! - 20)
-        const endIndex = Math.min(
-          toolDescription.length,
-          match.index! + match[0].length + 20
+  const edgesByKey = new Map<string, CrossOriginEdge>()
+  let lastMentionedServer: string | undefined
+
+  const addEdge = (
+    targetServer: string,
+    targetTool: string | undefined,
+    matchText: string,
+    matchIndex: number
+  ) => {
+    const edgeKey = [
+      canonicalizeName(currentServerName),
+      canonicalizeName(targetServer),
+      targetTool ? canonicalizeName(targetTool) : '',
+    ].join('->')
+
+    if (edgesByKey.has(edgeKey)) {
+      return
+    }
+
+    const startIndex = Math.max(0, matchIndex - 20)
+    const endIndex = Math.min(
+      toolDescription.length,
+      matchIndex + matchText.length + 20
+    )
+
+    edgesByKey.set(edgeKey, {
+      sourceServer: currentServerName,
+      sourceTool: '',
+      targetServer,
+      targetTool,
+      context:
+        '...' +
+        toolDescription.substring(startIndex, endIndex) +
+        '...',
+    })
+  }
+
+  let offset = 0
+  for (const whitespaceToken of toolDescription.split(/\s+/)) {
+    // Split dotted/slashed references such as "mcp_bravo.lookup_calendar"
+    // or "bravo/lookup_calendar" into separately resolvable name parts.
+    for (const cleanedToken of whitespaceToken
+      .split(/[./]+/)
+      .map((part) => part.replace(/^[('"]+|[)'".:,;!?]+$/g, ''))
+      .filter(Boolean)) {
+      const matchIndex = toolDescription.indexOf(
+        cleanedToken,
+        offset
+      )
+      if (matchIndex === -1) {
+        continue
+      }
+      offset = matchIndex + cleanedToken.length
+
+      const tokenKey = canonicalizeName(cleanedToken)
+
+      const serverEntry = serverByKey.get(tokenKey)
+      if (serverEntry) {
+        lastMentionedServer = serverEntry.name
+        addEdge(
+          serverEntry.name,
+          undefined,
+          cleanedToken,
+          matchIndex
         )
-        const context = toolDescription.substring(
-          startIndex,
-          endIndex
-        )
+        continue
+      }
 
-        matches.push({
-          type: 'Cross-origin reference',
-          pattern: regex.toString().replace(/^\/|\/i$/g, ''),
-          match: match[0],
-          context: '...' + context + '...',
-          referencedServer: combinedServerNames.find(
-            // Match against normalized name
-            (name) =>
-              name.toLowerCase().replace(/_/g, '-') === cleanedToken
-          ),
-        })
+      const owners = toolOwners.get(tokenKey)
+      if (!owners || owners.length === 0) {
+        continue
+      }
+
+      let target:
+        | {serverName: string; toolName: string}
+        | undefined
+      if (
+        lastMentionedServer &&
+        owners.some(
+          (owner) => owner.serverName === lastMentionedServer
+        )
+      ) {
+        // Bind the tool to the server explicitly mentioned just before it.
+        target = owners.find(
+          (owner) => owner.serverName === lastMentionedServer
+        )
+      } else if (owners.length === 1) {
+        // A uniquely owned tool name identifies its target by itself.
+        target = owners[0]
+      }
+
+      // Ambiguous tool names without a server mention are not reportable.
+      if (target) {
+        addEdge(
+          target.serverName,
+          target.toolName,
+          cleanedToken,
+          matchIndex
+        )
       }
     }
   }
 
+  // A bare server mention is upgraded to a tool-level edge whenever the
+  // description also names one of that server's tools.
+  const edges = Array.from(edgesByKey.values())
+  for (const edge of edges) {
+    if (edge.targetTool) {
+      continue
+    }
+    const entry = serverByKey.get(
+      canonicalizeName(edge.targetServer)
+    )
+    if (!entry) {
+      continue
+    }
+    for (const [toolKey, toolName] of entry.toolByKey) {
+      if (
+        edgesByKey.has(
+          [
+            canonicalizeName(currentServerName),
+            canonicalizeName(edge.targetServer),
+            toolKey,
+          ].join('->')
+        )
+      ) {
+        edge.targetTool = toolName
+      }
+    }
+  }
+
+  // Collapse server-level and tool-level edges for the same target pair.
+  const deduped = new Map<string, CrossOriginEdge>()
+  for (const edge of edges) {
+    const key = [
+      canonicalizeName(edge.targetServer),
+      edge.targetTool ? canonicalizeName(edge.targetTool) : '',
+    ].join('->')
+    const existing = deduped.get(key)
+    if (!existing || (!existing.targetTool && edge.targetTool)) {
+      deduped.set(key, edge)
+    }
+  }
+
+  const dedupedEdges = Array.from(deduped.values())
   return {
-    detected: matches.length > 0,
-    matches,
+    detected: dedupedEdges.length > 0,
+    edges: dedupedEdges,
   }
 }

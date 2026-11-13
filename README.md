@@ -48,7 +48,37 @@ npx mcp-shield --safe-list "github,slack,whatsapp"
 - `--claude-api-key <key>`: (Optional) Provide an Anthropic Claude API key for enhanced vulnerability analysis using AI.
 - `--identify-as <client-name>`: (Optional) Identify as a different client name (e.g., `claude-desktop`) when connecting to servers. Useful for testing if servers behave differently based on the client ID (potential bait-and-switch).
 - `--safe-list <servers>`: (Optional) Comma-separated list of server names to exclude from scanning. These servers will be skipped and also excluded from cross-origin violation detection.
+- `--json`: (Optional) Emit machine-readable JSON instead of the interactive tree. Cross-origin findings are returned as a de-duplicated `graph` of `source {server, tool} -> target {server, tool}` edges, each carrying its severity.
 - `-h, --help`: Display help information.
+
+### Cross-origin relationship graph
+
+Cross-origin findings describe directed relationships between tools of two
+different servers. Server and tool names are canonicalized before matching,
+so underscore/hyphen aliases and casing differences (`mcp_whatsapp`,
+`MCP-WhatsApp`, `mcp-whatsapp`) resolve to the same target. Each
+`source/tool -> target/tool` pair is reported exactly once regardless of how
+many times it is mentioned, edges are emitted in a stable sorted order, and
+the `MEDIUM` severity is preserved.
+
+The safe list applies to **both ends** of every relationship: a safe-listed
+server is skipped as a scan source and can never appear as a cross-origin
+target (including implicit references to the built-in popular servers).
+
+### Offline acceptance tests
+
+The repository ships local stdio MCP fixtures under `fixtures/` that
+reference each other through underscore aliases and mixed casing. After
+building, run the acceptance suite without any network access:
+
+```bash
+npm run build
+npm run test:acceptance
+```
+
+The suite asserts relationship de-duplication, severity retention, safe-list
+filtering on both ends, and stable ordering, using the built CLI in
+`dist/` against the offline fixtures.
 
 ## Output Example
 
